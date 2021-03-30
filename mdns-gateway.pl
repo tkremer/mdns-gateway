@@ -52,13 +52,16 @@ my $bind = [ "127.0.0.1", 5354 ];
   # We're picky about what we accept.
   # A bit too picky for some regular tools it seems...
   # We're responding to EDNS with a FORMERR as per spec now.
-  # TODO: EDNS support
+  # DONE: EDNS support - at least we're accepting EDNS queries now. Answers are still regular DNS.
+  # TODO: respect packet size limits.
+  # TODO: enforce domain length limits.
+  # TODO: support label compression in parsing (though probably only possible in insane requests).
 
-  #my $request_rex = pack "C*", qw(1 0  0 1 0 0  0 0 0 0);
-  #                 flags, #questions, #answers, #auths, #adds
-  my $request_rex = pack "n*", 0x0100, 1,0,0,0;
-  #                  ident,...,       host,          type,class
-  $request_rex = qr/^(..)(?:$request_rex([^\0]{0,254})\0(..)\0\x01$)?/s;
+  # #my $request_rex = pack "C*", qw(1 0  0 1 0 0  0 0 0 0);
+  # #                 flags, #questions, #answers, #auths, #adds
+  # my $request_rex = pack "n*", 0x0100, 1,0,0,0;
+  # #                  ident,...,       host,          type,class
+  # $request_rex = qr/^(..)(?:$request_rex([^\0]{0,254})\0(..)\0\x01$)?/s;
 
   # FYI, from wikipedia (last ones are special):
   %rec_types = qw(
@@ -145,7 +148,8 @@ my $bind = [ "127.0.0.1", 5354 ];
   #   string representation of an IPv4 or IPv6 address.
   # The content of the RR is used verbatim, no label compression is attempted.
   sub pack_answer {
-    my ($req_raw,$answer) = @_;
+    my ($request,$answer) = @_;
+    my $req_raw = $request->{raw};
     #  return mkanswer($$answer{request}//$req_raw,@$answer{qw(ok answers)});
     #}
     #sub mkanswer {
@@ -153,18 +157,40 @@ my $bind = [ "127.0.0.1", 5354 ];
     my $ok = $answer->{ok};
     my @replies = @$answer{qw(answers authorities additionals)};
     $_ //= [] for @replies;
+    my $edns = $answer->{edns};
+    if ($request->{edns} && $edns) {
+      my ($pl,$xrc,$opt) = (4096,0,undef);
+        # FIXME: xrc is xrcode,version and flags
+      ($pl,$xrc,$opt) = @{$answer->{edns}}{qw(payload_size xrcode options)}
+        if ref $edns;
+      my $rr = {
+        name    => "\0",
+        type    => $rec_types{OPT},
+        class   => $pl,
+        ttl     => $xrc,
+        content => pack "(n n/a*)*", %{$opt//{}},
+      };
+      push @{$replies[2]}, $rr;
+    }
     my $ret = 0x8180 + ($answer->{RCODE} // ($ok?0:3));
     my $res = $req_raw;
     substr($res,2,2) = pack "n", $ret;
     substr($res,6,6) = pack "n3", map scalar(@$_), @replies;
     for (map @$_, @replies) {
       my ($type,$class,$ttl,$length,$content) = (1,1,60,0,"");
+      my $name = pack "n", 0xc00c;
       if (ref($_) eq "HASH") {
         $type = $$_{type};
+        $name = $$_{name} if exists $$_{name};
         $class = $$_{class} if exists $$_{class};
         $ttl = $$_{ttl} if exists $$_{ttl};
         $content = $$_{content} if exists $$_{content};
         $length = length($content);
+        if (ref $name eq "ARRAY") {
+          $name = pack "(C/a*)*", @$name;
+        } elsif (ref $name eq "SCALAR") {
+          $name = pack "(C/a*)*", split /\./,$$name;
+        }
         die "RR needs a type" unless defined $type;
       } elsif (ref($_) eq "SCALAR") {
         $content = $$_;
@@ -195,7 +221,7 @@ my $bind = [ "127.0.0.1", 5354 ];
       } else {
         die "invalid IP format";
       }
-      $res .= pack "n nn N n a*", 0xc00c, $type,$class,$ttl,$length,$content;
+      $res .= pack "a* nn N n a*", $name,$type,$class,$ttl,$length,$content;
     }
     return $res;
 #  $id 81 (80+3*$NXDOMAIN) 0 1 0 $results 0 0 0 0 $request
@@ -204,20 +230,99 @@ my $bind = [ "127.0.0.1", 5354 ];
 
   sub parse_request {
     my $msg = shift;
-    if ($msg =~ /$request_rex/) {
-      my ($nonce,$packedhost,$type) = ($1,$2,$3);
-      if (!defined $type) {
-        # bad format. Probably EDNS. return FORMERR.
-        return { raw => $nonce.("\0"x10), FORMERR => 1 };
+    return undef if length($msg) < 12;
+    my ($nonce,$flags,@sections) = unpack "a2 n5", $msg;
+    return undef if $flags & 0x8000; # response from someone else.
+    my ($minflags,$badflags) = (0x0000,0xe000); # query|QUERY
+      # should we disallow response bits?
+    my $formerr = { raw => $nonce.("\0"x10), FORMERR => 1 };
+    return $formerr if ~$flags & $minflags || $flags & $badflags
+         || ($sections[0] != 1) || $sections[1] || $sections[2];
+    my $secdata = substr($msg,12);
+    my $in_question = 1;
+    my $rawlen;
+    for (@sections) {
+      my @entries;
+      for (1..$_) {
+        my @labels;
+        my $l = 1;
+        while($l) {
+          return $formerr unless length $secdata;
+          $l = unpack "C", $secdata;
+          substr($secdata,0,1) = "";
+          if ($l & 0xc0) {
+            return $formerr if (~$l & 0xc0);
+            return $formerr; # because we can't handle these yet.
+            push @labels, $l;
+            last;
+          }
+          return $formerr unless length($secdata) >= $l;
+          push @labels, substr($secdata,0,$l);
+          substr($secdata,0,$l) = "";
+        }
+        my @params = eval {
+          unpack $in_question ? "nn" : "nnN n/a*", $secdata;
+        };
+        return $formerr if $@;
+        $l = $in_question ? 4 : 10+length($params[-1]//"");
+        return $formerr unless length($secdata) >= $l;
+        substr($secdata,0,$l) = "";
+        die "something slipped through" unless @labels && $labels[-1] eq "";
+        pop @labels;
+        my $name = join ".",
+          map lc($_) =~ s/([^-a-z0-9])/sprintf "\\x%02x", ord($1)/gers, @labels;
+        my @vars = (qw(labels name type class),$in_question?():qw(ttl rdata));
+        my %entry;
+        @entry{@vars} = (\@labels,$name,@params);
+        push @entries, \%entry;
       }
-      $type = unpack "n", $type;
-      my $host = unpack_host($packedhost);
-      if (defined $host) {
-        return { host => $host, type => $type, raw => $msg };
+      if ($in_question) {
+        $in_question = 0;
+        $rawlen = length($msg)-length($secdata);
       }
+      $_ = \@entries;
     }
-    return undef;
+    my @opt = grep $_->{type} == $rec_types{OPT}, @{$sections[3]};
+    return $formerr
+      if $secdata ne "" || $sections[0][0]{class} != 1 || @opt > 1;
+    my $res = { raw => substr($msg,0,$rawlen),
+             question => $sections[0][0],
+             additionals => $sections[3],
+             sections => \@sections,
+             host => $sections[0][0]{name},
+             type => $sections[0][0]{type}
+           };
+    if (@opt) {
+      return $formerr unless $opt[0]{name} eq "";
+      my ($payload_size,$xRCODE,$data) = @{$opt[0]}{qw(class ttl rdata)};
+      my %options = eval { unpack "(n n/a*)*", $data; };
+      return $formerr if $@;
+      $res->{edns} = { payload_size => $payload_size,
+                       xrcode => $xRCODE,
+                       options => \%options
+                     };
+    }
+    #use Data::Dumper;
+    #print STDERR Dumper($res->{sections});
+    return $res;
   }
+
+  # sub parse_request_old {
+  #   my $msg = shift;
+  #   if ($msg =~ /$request_rex/) {
+  #     my ($nonce,$packedhost,$type) = ($1,$2,$3);
+  #     if (!defined $type) {
+  #       # bad format. Probably EDNS. return FORMERR.
+  #       return { raw => $nonce.("\0"x10), FORMERR => 1 };
+  #     }
+  #     $type = unpack "n", $type;
+  #     my $host = unpack_host($packedhost);
+  #     if (defined $host) {
+  #       return { host => $host, type => $type, raw => $msg };
+  #     }
+  #   }
+  #   return undef;
+  # }
 
   # $resolver = mapped_resolver([
   #   [qr/^.*\.some\.domain$/,$resolver1]
@@ -324,7 +429,7 @@ my $bind = [ "127.0.0.1", 5354 ];
         #print STDERR main::hexdump($msg);
         return unless defined $request;
         if ($request->{FORMERR}) {
-          my $packet = pack_answer($request->{raw},{ RCODE => 1 });
+          my $packet = pack_answer($request,{ RCODE => 1 });
           $handle->push_send($packet,$client_addr);
           return;
         }
@@ -333,7 +438,8 @@ my $bind = [ "127.0.0.1", 5354 ];
           my $answer = shift;
           return unless defined $answer;
           eval {
-            my $packet = pack_answer($msg,$answer);
+            $answer->{edns} = 1;
+            my $packet = pack_answer($request,$answer);
             #printf STDERR "(%d)>\n", scalar(@{$answer->{answers}//[]});
             #print STDERR main::hexdump($packet);
             $handle->push_send($packet,$client_addr);
