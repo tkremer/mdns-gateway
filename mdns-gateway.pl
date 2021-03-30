@@ -187,9 +187,9 @@ my $bind = [ "127.0.0.1", 5354 ];
         $content = $$_{content} if exists $$_{content};
         $length = length($content);
         if (ref $name eq "ARRAY") {
-          $name = pack "(C/a*)*", @$name;
+          $name = pack("(C/a*)*", @$name)."\0";
         } elsif (ref $name eq "SCALAR") {
-          $name = pack "(C/a*)*", split /\./,$$name;
+          $name = pack("(C/a*)*", split /\./,$$name)."\0";
         }
         die "RR needs a type" unless defined $type;
       } elsif (ref($_) eq "SCALAR") {
