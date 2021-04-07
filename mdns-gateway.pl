@@ -221,7 +221,9 @@ my $bind = [ "127.0.0.1", 5354 ];
       } else {
         die "invalid IP format";
       }
-      $res .= pack "a* nn N n a*", $name,$type,$class,$ttl,$length,$content;
+      die "something wrong with the length calculation"
+        unless $length == length($content);
+      $res .= pack "a* nn N n/a*", $name,$type,$class,$ttl,$content;
     }
     return $res;
 #  $id 81 (80+3*$NXDOMAIN) 0 1 0 $results 0 0 0 0 $request
@@ -253,6 +255,8 @@ my $bind = [ "127.0.0.1", 5354 ];
           if ($l & 0xc0) {
             return $formerr if (~$l & 0xc0);
             return $formerr; # because we can't handle these yet.
+            $l = $l << 8 | unpack("C", $secdata);
+            substr($secdata,0,1) = "";
             push @labels, $l;
             last;
           }
